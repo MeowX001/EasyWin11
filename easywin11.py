@@ -113,13 +113,102 @@ def clear_event_logs():
             ok(f"{log} log cleared.")
     pause()
 
+RAMMAP_PATH = r"C:\Tools\RAMMap\RAMMap.exe"
+RAMMAP_URL  = "https://download.sysinternals.com/files/RAMMap.zip"
+# Registry key where Sysinternals tools store EULA acceptance
+RAMMAP_EULA_KEY = r"Software\Sysinternals\RamMap"
+
+def _rammap_eula_accepted():
+    """Check if the RAMMap EULA has been accepted in the registry."""
+    import winreg
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RAMMAP_EULA_KEY)
+        val, _ = winreg.QueryValueEx(key, "EulaAccepted")
+        winreg.CloseKey(key)
+        return val == 1
+    except Exception:
+        return False
+
+def _accept_rammap_eula():
+    """Write EULA acceptance to registry so RAMMap runs silently."""
+    import winreg
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, RAMMAP_EULA_KEY)
+        winreg.SetValueEx(key, "EulaAccepted", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(key)
+        return True
+    except Exception as e:
+        print(f"  {C.RED}Could not write EULA to registry: {e}{C.RESET}")
+        return False
+
+def _ensure_rammap():
+    """Download and extract RAMMap if not already present. Returns path or None."""
+    if os.path.exists(RAMMAP_PATH):
+        return RAMMAP_PATH
+    import urllib.request, zipfile, io
+    rammap_dir = os.path.dirname(RAMMAP_PATH)
+    info("RAMMap not found. Downloading from Sysinternals...")
+    try:
+        os.makedirs(rammap_dir, exist_ok=True)
+        with urllib.request.urlopen(RAMMAP_URL, timeout=20) as resp:
+            zip_data = resp.read()
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+            for member in z.namelist():
+                if member.lower().endswith("rammap.exe"):
+                    with z.open(member) as src, open(RAMMAP_PATH, "wb") as dst:
+                        dst.write(src.read())
+                    break
+        if os.path.exists(RAMMAP_PATH):
+            ok(f"RAMMap downloaded to {rammap_dir}")
+            return RAMMAP_PATH
+        else:
+            print(f"  {C.RED}RAMMap.exe not found inside the zip.{C.RESET}")
+            return None
+    except Exception as e:
+        print(f"  {C.RED}Download failed: {e}{C.RESET}")
+        return None
+
 def flush_ram():
-    header("Empty Standby RAM")
-    info("Flushing standby memory list (requires admin + RAMMap optional)...")
-    # Use built-in: purge standby via EmptyStandbyList if available
-    empty_standby = r"C:\Windows\System32\rundll32.exe advapi32.dll,ProcessIdleTasks"
-    run(empty_standby)
-    ok("Idle tasks processed. RAM standby list refreshed.")
+    header("Empty Standby RAM  (via RAMMap)")
+    if not is_admin():
+        print(f"  {C.RED}Administrator rights required for this operation.{C.RESET}")
+        pause()
+        return
+
+    rammap = _ensure_rammap()
+    if not rammap:
+        print(f"  {C.YELLOW}Could not obtain RAMMap. Check your internet connection.{C.RESET}")
+        pause()
+        return
+
+    # RAMMap shows a EULA dialog on first ever launch which blocks -Et silently.
+    # We accept it via registry so it always runs headless.
+    if not _rammap_eula_accepted():
+        info("First-time setup: accepting RAMMap EULA via registry...")
+        if _accept_rammap_eula():
+            ok("EULA accepted. RAMMap will now run silently.")
+        else:
+            print(f"\n  {C.YELLOW}Could not auto-accept the EULA.{C.RESET}")
+            print(f"  {C.WHITE}Please do this once manually:{C.RESET}")
+            print(f"  {C.DIM}1. Open:  {RAMMAP_PATH}{C.RESET}")
+            print(f"  {C.DIM}2. Click 'Agree' on the license dialog.{C.RESET}")
+            print(f"  {C.DIM}3. Close RAMMap, then run this option again.{C.RESET}")
+            print(f"\n  {C.YELLOW}Opening RAMMap now for you...{C.RESET}")
+            subprocess.Popen([rammap])
+            pause()
+            return
+
+    info("Running RAMMap -Et  (Empty Standby List)...")
+    try:
+        result = subprocess.run(
+            [rammap, "-Et"],
+            capture_output=True, text=True, timeout=30
+        )
+        ok("Standby RAM list emptied successfully.")
+    except subprocess.TimeoutExpired:
+        print(f"  {C.YELLOW}RAMMap timed out after 30s.{C.RESET}")
+    except Exception as e:
+        print(f"  {C.RED}Error: {e}{C.RESET}")
     pause()
 
 def disable_startup_apps():
@@ -151,17 +240,52 @@ def power_plan():
     header("Power Plan")
     print(f"  {C.WHITE}Select a power plan:{C.RESET}\n")
     plans = [
-        ("High Performance",        "powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"),
-        ("Balanced (default)",      "powercfg /setactive 381b4222-f694-41f0-9685-ff5bb260df2e"),
-        ("Power Saver",             "powercfg /setactive a1841308-3541-4fab-bc81-f71556f20b4a"),
-        ("Ultimate Performance",    "powercfg /setactive e9a42b02-d5df-448d-aa00-03f14749eb61"),
+        ("High Performance",     "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c", False),
+        ("Balanced (default)",   "381b4222-f694-41f0-9685-ff5bb260df2e", False),
+        ("Power Saver",          "a1841308-3541-4fab-bc81-f71556f20b4a", False),
+        ("Ultimate Performance", "e9a42b02-d5df-448d-aa00-03f14749eb61", True),
     ]
-    choice = menu_choice(plans)
+    choice = menu_choice([(label, None) for label, _, _ in plans])
     if choice == 0:
         return
-    label, cmd = plans[choice - 1]
-    run(cmd)
-    ok(f'"{label}" power plan activated.')
+    label, guid, needs_provision = plans[choice - 1]
+
+    if needs_provision:
+        info("Provisioning Ultimate Performance plan...")
+        out = run(f"powercfg -duplicatescheme {guid}", capture=True) or ""
+        # Extract the GUID powercfg just created (it prints a new one)
+        new_guid = None
+        for word in out.split():
+            word = word.strip("().,:").lower()
+            if len(word) == 36 and word.count("-") == 4:
+                new_guid = word
+                break
+        activate_guid = new_guid if new_guid else guid
+    else:
+        activate_guid = guid
+
+    # Attempt activation, capture stderr to detect "unsupported setting"
+    result = subprocess.run(
+        f"powercfg /setactive {activate_guid}",
+        shell=True, capture_output=True, text=True
+    )
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+
+    if "unsupported" in stderr.lower() or "unsupported" in stdout.lower():
+        print(f"  {C.RED}This plan is not supported on your hardware.{C.RESET}")
+        print(f"  {C.YELLOW}Ultimate Performance is only available on desktops.")
+        print(f"  Laptops and VMs do not support it.{C.RESET}")
+        pause()
+        return
+
+    # Verify by reading back the active scheme
+    active = run("powercfg /getactivescheme", capture=True) or ""
+    if activate_guid.lower() in active.lower():
+        ok(f'"{label}" power plan is now active.')
+    else:
+        print(f"  {C.YELLOW}Could not confirm. Active scheme reported as:{C.RESET}")
+        print(f"  {C.DIM}{active}{C.RESET}")
     pause()
 
 # ─── Network Tweak Actions ────────────────────────────────────────────────────
